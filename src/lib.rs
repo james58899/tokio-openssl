@@ -8,10 +8,13 @@
 use futures_util::future;
 use openssl::error::ErrorStack;
 use openssl::ssl::{self, ErrorCode, ShutdownResult, Ssl, SslRef};
-use std::fmt;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::{
+    fmt,
+    os::fd::{AsRawFd, RawFd},
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[cfg(test)]
@@ -79,19 +82,25 @@ where
     }
 }
 
-fn cvt<T>(r: io::Result<T>) -> Poll<io::Result<T>> {
+fn cvt<T>(r: io::Result<T>, ctx: &mut Context<'_>) -> Poll<io::Result<T>> {
     match r {
         Ok(v) => Poll::Ready(Ok(v)),
-        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+            ctx.waker().wake_by_ref();
+            Poll::Pending
+        }
         Err(e) => Poll::Ready(Err(e)),
     }
 }
 
-fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
+fn cvt_ossl<T>(r: Result<T, ssl::Error>, ctx: &mut Context<'_>) -> Poll<Result<T, ssl::Error>> {
     match r {
         Ok(v) => Poll::Ready(Ok(v)),
         Err(e) => match e.code() {
-            ErrorCode::WANT_READ | ErrorCode::WANT_WRITE => Poll::Pending,
+            ErrorCode::WANT_READ | ErrorCode::WANT_WRITE => {
+                ctx.waker().wake_by_ref();
+                Poll::Pending
+            }
             _ => Poll::Ready(Err(e)),
         },
     }
@@ -100,6 +109,16 @@ fn cvt_ossl<T>(r: Result<T, ssl::Error>) -> Poll<Result<T, ssl::Error>> {
 /// An asynchronous version of [`openssl::ssl::SslStream`].
 #[derive(Debug)]
 pub struct SslStream<S>(ssl::SslStream<StreamWrapper<S>>);
+
+impl<S> SslStream<S>
+where
+    S: AsyncRead + AsyncWrite + AsRawFd,
+{
+    /// Like [`SslStream::new`](ssl::SslStream::new).
+    pub fn new_fd(ssl: Ssl, stream: S) -> Result<Self, ErrorStack> {
+        ssl::SslStream::new_fd(ssl, StreamWrapper { stream, context: 0 }).map(SslStream)
+    }
+}
 
 impl<S> SslStream<S>
 where
@@ -115,7 +134,7 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.connect()))
+        self.with_context(cx, |cx, s| cvt_ossl(s.connect(), cx))
     }
 
     /// A convenience method wrapping [`poll_connect`](Self::poll_connect).
@@ -125,7 +144,7 @@ where
 
     /// Like [`SslStream::accept`](ssl::SslStream::accept).
     pub fn poll_accept(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.accept()))
+        self.with_context(cx, |cx, s| cvt_ossl(s.accept(), cx))
     }
 
     /// A convenience method wrapping [`poll_accept`](Self::poll_accept).
@@ -138,7 +157,7 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<(), ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.do_handshake()))
+        self.with_context(cx, |cx, s| cvt_ossl(s.do_handshake(), cx))
     }
 
     /// A convenience method wrapping [`poll_do_handshake`](Self::poll_do_handshake).
@@ -152,7 +171,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.ssl_peek(buf)))
+        self.with_context(cx, |cx, s| cvt_ossl(s.ssl_peek(buf), cx))
     }
 
     /// A convenience method wrapping [`poll_peek`](Self::poll_peek).
@@ -167,7 +186,7 @@ where
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.read_early_data(buf)))
+        self.with_context(cx, |cx, s| cvt_ossl(s.read_early_data(buf), cx))
     }
 
     /// A convenience method wrapping [`poll_read_early_data`](Self::poll_read_early_data).
@@ -186,7 +205,7 @@ where
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, ssl::Error>> {
-        self.with_context(cx, |s| cvt_ossl(s.write_early_data(buf)))
+        self.with_context(cx, |cx, s| cvt_ossl(s.write_early_data(buf), cx))
     }
 
     /// A convenience method wrapping [`poll_write_early_data`](Self::poll_write_early_data).
@@ -222,11 +241,11 @@ impl<S> SslStream<S> {
 
     fn with_context<F, R>(self: Pin<&mut Self>, ctx: &mut Context<'_>, f: F) -> R
     where
-        F: FnOnce(&mut ssl::SslStream<StreamWrapper<S>>) -> R,
+        F: FnOnce(&mut Context<'_>, &mut ssl::SslStream<StreamWrapper<S>>) -> R,
     {
         let this = unsafe { self.get_unchecked_mut() };
         this.0.get_mut().context = ctx as *mut _ as usize;
-        let r = f(&mut this.0);
+        let r = f(ctx, &mut this.0);
         this.0.get_mut().context = 0;
         r
     }
@@ -241,9 +260,9 @@ where
         ctx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        self.with_context(ctx, |s| {
+        self.with_context(ctx, |ctx, s| {
             // SAFETY: read_uninit does not de-initialize the buffer.
-            match cvt(s.read_uninit(unsafe { buf.unfilled_mut() }))? {
+            match cvt(s.read_uninit(unsafe { buf.unfilled_mut() }), ctx)? {
                 Poll::Ready(nread) => {
                     // SAFETY: read_uninit guarantees that nread bytes have been initialized.
                     unsafe { buf.assume_init(nread) };
@@ -261,15 +280,15 @@ where
     S: AsyncRead + AsyncWrite,
 {
     fn poll_write(self: Pin<&mut Self>, ctx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
-        self.with_context(ctx, |s| cvt(s.write(buf)))
+        self.with_context(ctx, |ctx, s| cvt(s.write(buf), ctx))
     }
 
     fn poll_flush(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<io::Result<()>> {
-        self.with_context(ctx, |s| cvt(s.flush()))
+        self.with_context(ctx, |ctx, s| cvt(s.flush(), ctx))
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<io::Result<()>> {
-        match self.as_mut().with_context(ctx, |s| s.shutdown()) {
+        match self.as_mut().with_context(ctx, |ctx, s| s.shutdown()) {
             Ok(ShutdownResult::Sent) | Ok(ShutdownResult::Received) => {}
             Err(ref e) if e.code() == ErrorCode::ZERO_RETURN => {}
             Err(ref e) if e.code() == ErrorCode::WANT_READ || e.code() == ErrorCode::WANT_WRITE => {
@@ -283,5 +302,11 @@ where
         }
 
         self.get_pin_mut().poll_shutdown(ctx)
+    }
+}
+
+impl<S: AsRawFd> AsRawFd for StreamWrapper<S> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
